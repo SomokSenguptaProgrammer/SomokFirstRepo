@@ -1,0 +1,16 @@
+ShopifyAudit is a service that helps e-commerce store owners improve their conversion rates. 
+We analyze Shopify stores and provide actionable recommendations to increase sales.
+
+Our services include:
+- Conversion rate optimization audits
+- User experience analysis
+- Checkout flow improvements
+- Mobile responsiveness testing
+- Page speed optimization
+
+We work with stores doing $10k-$500k per month in revenue.
+Our typical audit takes 3-5 business days and costs $499.
+
+Common issues we find include slow page load times, complicated checkout processes, 
+and poor mobile experiences. Most clients see a 15-30% improvement in conversion rates 
+after implementing our recommendations.
