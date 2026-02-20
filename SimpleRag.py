@@ -11,135 +11,196 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import faiss
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 
 # -----------------------------------------------------------------------------
-# 1. LOAD THE DOCUMENT
+# Lazy initialization: document and FAISS index are created on first query
 # -----------------------------------------------------------------------------
-# Read the text file that contains the content we want to query
-with open("RagDocument.txt", "r", encoding="utf-8") as f:
-    document_text = f.read()
-
-print("Document loaded successfully!")
-
-# -----------------------------------------------------------------------------
-# 2. CHUNK THE DOCUMENT
-# -----------------------------------------------------------------------------
-# Change this to compare results: 200 = smaller, more precise chunks; 1000 = larger context
 CHUNK_SIZE = 200  # Try 1000 for comparison
-chunks = []
+_rag_initialized = False
 
-for i in range(0, len(document_text), CHUNK_SIZE):
-    chunk = document_text[i : i + CHUNK_SIZE]
-    if chunk.strip():  # Skip empty chunks
-        chunks.append(chunk)
+# Set by initialize_rag(); used by get_embedding, query_rag, query_rag_async
+document_text = None
+chunks = None
+chunk_embeddings = None
+index = None
+openai_client = None
+async_openai_client = None
 
-# 1. Show how many chunks were created
-print(f"Chunks created: {len(chunks)}")
 
-# 2. Show the size (character count) of each chunk
-for i, chunk in enumerate(chunks):
-    print(f"  Chunk {i}: {len(chunk)} characters")
+def initialize_rag():
+    """Initialize the RAG system: load document, create chunks, build FAISS index."""
+    global document_text, chunks, chunk_embeddings, index, openai_client, async_openai_client
 
-# -----------------------------------------------------------------------------
-# 3. STORE CHUNKS IN FAISS
-# -----------------------------------------------------------------------------
-# FAISS is a vector similarity search library - it stores embeddings for fast lookup
-# We use OpenAI to create embeddings (numerical representations that capture meaning)
+    # Resolve document path: Modal uses /root, local run uses project directory
+    doc_path = "/root/RagDocument.txt" if os.path.exists("/root/RagDocument.txt") else "RagDocument.txt"
+    with open(doc_path, "r", encoding="utf-8") as f:
+        document_text = f.read()
+    print("Document loaded successfully!")
 
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    # Chunk the document
+    chunks = []
+    for i in range(0, len(document_text), CHUNK_SIZE):
+        chunk = document_text[i : i + CHUNK_SIZE]
+        if chunk.strip():
+            chunks.append(chunk)
+    print(f"Chunks created: {len(chunks)}")
+    for i, chunk in enumerate(chunks):
+        print(f"  Chunk {i}: {len(chunk)} characters")
+
+    # OpenAI clients and FAISS index
+    openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    async_openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+    def get_embedding(text: str) -> list[float]:
+        """Get embedding vector for text using OpenAI's embedding API."""
+        response = openai_client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text,
+        )
+        return response.data[0].embedding
+
+    chunk_embeddings = [get_embedding(chunk) for chunk in chunks]
+    embedding_array = np.array(chunk_embeddings).astype("float32")
+    embedding_dim = embedding_array.shape[1]
+    index = faiss.IndexFlatL2(embedding_dim)
+    index.add(embedding_array)
+    print("Chunks stored in FAISS!")
+
 
 def get_embedding(text: str) -> list[float]:
-    """Get embedding vector for text using OpenAI's embedding API."""
+    """Get embedding vector for text using OpenAI's embedding API (requires initialize_rag first)."""
     response = openai_client.embeddings.create(
         model="text-embedding-3-small",
-        input=text
+        input=text,
     )
     return response.data[0].embedding
 
-# Create embeddings for all chunks
-chunk_embeddings = [get_embedding(chunk) for chunk in chunks]
-embedding_array = np.array(chunk_embeddings).astype("float32")
 
-# Create FAISS index (flat index for exact search - good for small datasets)
-embedding_dim = embedding_array.shape[1]
-index = faiss.IndexFlatL2(embedding_dim)
-index.add(embedding_array)
+def query_rag(question: str, max_results: int = 3) -> tuple[str, list[str]]:
+    """
+    Query the RAG system with a question and return the answer plus source chunks.
+    Used by both the interactive script and the FastAPI app.
+    """
+    global _rag_initialized
+    if not _rag_initialized:
+        initialize_rag()
+        _rag_initialized = True
 
-print("Chunks stored in FAISS!")
+    # Embed the question and search FAISS for top k similar chunks
+    question_embedding = np.array([get_embedding(question)]).astype("float32")
+    k = min(max_results, len(chunks))
+    distances, indices = index.search(question_embedding, k)
 
-# -----------------------------------------------------------------------------
-# 4 & 5. GET USER QUESTION AND RETRIEVE RELEVANT CHUNKS
-# -----------------------------------------------------------------------------
-user_question = input("\nAsk a question about the document: ")
+    # Use indices to get the actual chunk texts (sorted by relevance)
+    retrieved_chunks = [chunks[i] for i in indices[0]]
 
-# Embed the question and search FAISS for top 3 similar chunks
-question_embedding = np.array([get_embedding(user_question)]).astype("float32")
-k = min(3, len(chunks))
-distances, indices = index.search(question_embedding, k)
+    # Build context from retrieved chunks
+    context = "\n\n---\n\n".join(retrieved_chunks)
 
-# Use indices to get the actual chunk texts (sorted by relevance)
-retrieved_chunks = [chunks[i] for i in indices[0]]
-
-# -----------------------------------------------------------------------------
-# DISPLAY RETRIEVED CHUNKS (with actual text and similarity scores)
-# -----------------------------------------------------------------------------
-SEPARATOR = "═" * 60
-print(f"\n{SEPARATOR}")
-print("  RETRIEVED CHUNKS")
-print(f"{SEPARATOR}\n")
-
-for rank, idx in enumerate(indices[0], start=1):
-    l2_distance = distances[0][rank - 1]
-    # Convert L2 distance to similarity: 1/(1+distance) → 0-1 scale (higher = more similar)
-    similarity = 1.0 / (1.0 + l2_distance)
-
-    print(f"  ┌─ Chunk #{rank} (index {idx})")
-    print(f"  │  Similarity: {similarity:.2%}  |  L2 distance: {l2_distance:.4f}  |  {len(chunks[idx])} chars")
-    print(f"  │")
-    print(f"  │  Text:")
-    for line in chunks[idx].splitlines():
-        print(f"  │    {line}")
-    print(f"  └{'─' * 58}\n")
-
-print(f"{SEPARATOR}\n")
-
-# -----------------------------------------------------------------------------
-# 6. SEND TO GPT-4 FOR ANSWER
-# -----------------------------------------------------------------------------
-# Build context from retrieved chunks
-context = "\n\n---\n\n".join(retrieved_chunks)
-
-# Create the prompt with context and question
-system_message = """You are a helpful assistant. Answer the user's question based ONLY on the provided context.
+    system_message = """You are a helpful assistant. Answer the user's question based ONLY on the provided context.
 If the context doesn't contain the answer, say so. Be concise and accurate."""
 
-user_message = f"""Context from the document:
+    user_message = f"""Context from the document:
 
 {context}
 
 ---
 
-Question: {user_question}
+Question: {question}
 
 Answer:"""
 
-# Call OpenAI GPT-4 API
-response = openai_client.chat.completions.create(
-    model="gpt-4o",  # GPT-4 model (use gpt-4o-mini for lower cost)
-    messages=[
-        {"role": "system", "content": system_message},
-        {"role": "user", "content": user_message}
-    ]
-)
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_message}
+        ]
+    )
+
+    answer = response.choices[0].message.content
+    return answer, retrieved_chunks
+
+
+async def query_rag_async(question: str, max_results: int = 3) -> tuple[str, list[str]]:
+    """
+    Async version of query_rag for FastAPI. Uses AsyncOpenAI so API calls
+    don't block the event loop—multiple concurrent requests can run in parallel.
+    """
+    global _rag_initialized
+    if not _rag_initialized:
+        initialize_rag()
+        _rag_initialized = True
+
+    # await: non-blocking embedding call—event loop can handle other requests
+    response = await async_openai_client.embeddings.create(
+        model="text-embedding-3-small",
+        input=question,
+    )
+    question_embedding = np.array([response.data[0].embedding]).astype("float32")
+
+    k = min(max_results, len(chunks))
+    distances, indices = index.search(question_embedding, k)
+    retrieved_chunks = [chunks[i] for i in indices[0]]
+
+    context = "\n\n---\n\n".join(retrieved_chunks)
+    system_message = """You are a helpful assistant. Answer the user's question based ONLY on the provided context.
+If the context doesn't contain the answer, say so. Be concise and accurate."""
+    user_message = f"""Context from the document:
+
+{context}
+
+---
+
+Question: {question}
+
+Answer:"""
+
+    # await: non-blocking chat completion—typically 1–5 seconds of I/O
+    response = await async_openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_message},
+        ],
+    )
+
+    answer = response.choices[0].message.content
+    return answer, retrieved_chunks
+
 
 # -----------------------------------------------------------------------------
-# 7. PRINT THE ANSWER
+# INTERACTIVE MODE (run as script)
 # -----------------------------------------------------------------------------
-answer = response.choices[0].message.content
+if __name__ == "__main__":
+    user_question = input("\nAsk a question about the document: ")
+    answer, retrieved_chunks = query_rag(user_question)
 
-print(f"{SEPARATOR}")
-print("  AI ANSWER")
-print(f"{SEPARATOR}\n")
-print(answer)
-print(f"\n{SEPARATOR}")
+    # Display retrieved chunks
+    SEPARATOR = "═" * 60
+    question_embedding = np.array([get_embedding(user_question)]).astype("float32")
+    k = min(3, len(chunks))
+    distances, indices = index.search(question_embedding, k)
+
+    print(f"\n{SEPARATOR}")
+    print("  RETRIEVED CHUNKS")
+    print(f"{SEPARATOR}\n")
+
+    for rank, idx in enumerate(indices[0], start=1):
+        l2_distance = distances[0][rank - 1]
+        similarity = 1.0 / (1.0 + l2_distance)
+        print(f"  ┌─ Chunk #{rank} (index {idx})")
+        print(f"  │  Similarity: {similarity:.2%}  |  L2 distance: {l2_distance:.4f}  |  {len(chunks[idx])} chars")
+        print(f"  │")
+        print(f"  │  Text:")
+        for line in chunks[idx].splitlines():
+            print(f"  │    {line}")
+        print(f"  └{'─' * 58}\n")
+
+    print(f"{SEPARATOR}\n")
+    print(f"{SEPARATOR}")
+    print("  AI ANSWER")
+    print(f"{SEPARATOR}\n")
+    print(answer)
+    print(f"\n{SEPARATOR}")

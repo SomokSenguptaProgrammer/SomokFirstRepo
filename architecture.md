@@ -11,7 +11,7 @@ A Retrieval-Augmented Generation system that answers questions based on document
 ### Indexing Phase (When SimpleRag.py runs):
 
 **Step 1: Document Loading**
-- Loads `document.txt` from local filesystem
+- Loads `requirements.txt` from local filesystem
 
 **Step 2: Text Chunking**
 - Splits document into 200-character chunks
